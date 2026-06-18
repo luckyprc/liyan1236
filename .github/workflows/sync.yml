@@ -1,45 +1,109 @@
-name: Sync Subscription
+name: Cellular Sub Sync
 
 on:
   schedule:
-    - cron: '0 */6 * * *'    # 每6小时同步一次（UTC时间）
-  workflow_dispatch:         # 允许手动触发
+    - cron: '0 */6 * * *'    # 每6小时自动同步
+  workflow_dispatch:          # 支持手动点一下运行
 
 jobs:
-  sync:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.SYNC_TOKEN }}
-          fetch-depth: 0
-
-      - name: Fetch subscription
+      - uses: actions/checkout@v4
+      
+      - name: Fetch & Optimize
+        env:
+          SUB_URL: ${{ secrets.SUB_URL }}
         run: |
-          curl -fsSL -o sub.txt \
-            "https://kuang3.bas5672.ccwu.cc/sub?token=94ac83d464012db1ead10968afbee029"
-          
-          # 验证文件是否为空
-          if [ ! -s sub.txt ]; then
-            echo "Error: Downloaded file is empty"
-            exit 1
-          fi
-          
-          # 统计节点数量
-          count=$(grep -c '^vless://' sub.txt || echo "0")
-          echo "Fetched $count nodes"
+          python3 << 'PYEOF'
+          import base64, re, urllib.request, os, json
 
-      - name: Commit and push
+          # 1. 下载原始订阅
+          req = urllib.request.Request(
+              os.environ['SUB_URL'], 
+              headers={'User-Agent': 'v2rayN/4.0'}
+          )
+          data = urllib.request.urlopen(req, timeout=30).read().decode('utf-8', errors='ignore')
+          lines = [l.strip() for l in data.splitlines() if l.strip() and l.startswith('vless://')]
+
+          # 2. 内置保底优选IP（中国大陆蜂窝网络常用，不保证最快但大概率能通）
+          CF_IPS = {
+              'mobile':  ['104.16.32.100', '104.18.1.100', '172.64.95.2'],
+              'unicom':  ['104.18.21.50', '162.159.62.8', '104.19.45.6'],
+              'telecom': ['172.65.230.14', '104.21.0.100', '172.67.0.100']
+          }
+
+          def get_host_port(url):
+              m = re.search(r'@([^:]+):(\d+)', url)
+              return (m.group(1), int(m.group(2))) if m else ('', 0)
+
+          def replace_host(url, new_host):
+              return re.sub(r'@([^:]+):', f'@{new_host}:', url, count=1)
+
+          def is_cf(host):
+              # 判断是否为 Cloudflare 节点
+              if host.startswith(('104.16.', '104.17.', '104.18.', '104.19.', '104.20.', '104.21.', '104.24.',
+                                  '172.64.', '162.159.', '108.162.', '2606:4700')):
+                  return True
+              if 'cloudflare' in host.lower() or '.cf.' in host.lower():
+                  return True
+              return False
+
+          direct_nodes = []   # 443端口落地节点（蜂窝最稳）
+          cf_nodes = []       # 8443/2096等CF节点（需要换IP）
+
+          for line in lines:
+              host, port = get_host_port(line)
+              if not host:
+                  continue
+              # 过滤IPv6（蜂窝下IPv6常出问题）
+              if '[' in host:
+                  continue
+              if port == 443:
+                  direct_nodes.append(line)
+              elif is_cf(host):
+                  cf_nodes.append(line)
+
+          os.makedirs('dist', exist_ok=True)
+
+          # 3. 生成各运营商订阅
+          for carrier in ['mobile', 'unicom', 'telecom', 'mixed']:
+              nodes = list(direct_nodes)  # 所有443落地节点全保留
+              
+              if carrier == 'mixed':
+                  # 混合版：每个CF节点用三大运营商各一个IP
+                  for node in cf_nodes:
+                      for c in ['mobile', 'unicom', 'telecom']:
+                          nodes.append(replace_host(node, CF_IPS[c][0]))
+              else:
+                  for node in cf_nodes:
+                      for ip in CF_IPS[carrier]:
+                          nodes.append(replace_host(node, ip))
+              
+              text = '\n'.join(nodes) + '\n'
+              with open(f'dist/sub_{carrier}.txt', 'w') as f:
+                  f.write(text)
+              with open(f'dist/sub_{carrier}_base64.txt', 'w') as f:
+                  f.write(base64.b64encode(text.encode()).decode() + '\n')
+
+          # 4. 写个说明文件
+          readme = f"""# 蜂窝网络订阅
+- 443落地节点：{len(direct_nodes)} 个（直接连，最稳）
+- CF优化节点：{len(cf_nodes)} 个（已替换优选IP）
+- 更新时间：见提交记录
+- 推荐订阅（自动选最优）：sub_mixed_base64.txt
+"""
+          with open('dist/README.md', 'w') as f:
+              f.write(readme)
+
+          print(f"Direct 443 nodes: {len(direct_nodes)}")
+          print(f"CF nodes optimized: {len(cf_nodes)}")
+          PYEOF
+
+      - name: Commit & Push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add sub.txt
-          
-          # 只有文件变更时才提交
-          if git diff --cached --quiet; then
-            echo "No changes detected"
-          else
-            git commit -m "sync: update subscription $(date +'%Y-%m-%d %H:%M:%S UTC')"
-            git push
-          fi
+          git add dist/
+          git diff --cached --quiet || git commit -m "sync: cellular subs $(date +%Y-%m-%d-%H:%M)"
+          git push
