@@ -1,5 +1,5 @@
 来自网页
-https://www.kejitt.top/jd/jiediana.html
+kuang3.bas5672.ccwu.cc
 的不定期更新
 
 
